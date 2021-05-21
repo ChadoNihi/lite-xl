@@ -1,6 +1,9 @@
+#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+
+#include <lauxlib.h>
 #include "rencache.h"
 
 /* a cache over the software renderer -- all drawing operations are stored as
@@ -14,7 +17,7 @@
 #define COMMAND_BUF_SIZE (1024 * 512)
 #define COMMAND_BARE_SIZE offsetof(Command, text)
 
-enum { FREE_FONT, SET_CLIP, DRAW_TEXT, DRAW_RECT, DRAW_TEXT_SUBPIXEL };
+enum { SET_CLIP, DRAW_TEXT, DRAW_RECT, DRAW_TEXT_SUBPIXEL };
 
 typedef struct {
   int8_t type;
@@ -24,11 +27,20 @@ typedef struct {
   int32_t size;
   RenRect rect;
   RenColor color;
-  FontDesc *font_desc;
+  int font_ref;
   CPReplaceTable *replacements;
   RenColor replace_color;
   char text[0];
 } Command;
+
+#define FONT_REFS_MAX 24
+struct FontRef {
+  FontDesc *font_desc;
+  int index;
+};
+typedef struct FontRef FontRef;
+FontRef font_refs[FONT_REFS_MAX];
+int font_refs_len = 0;
 
 
 static unsigned cells_buf1[CELLS_X * CELLS_Y];
@@ -44,6 +56,39 @@ static bool show_debug;
 
 static inline int min(int a, int b) { return a < b ? a : b; }
 static inline int max(int a, int b) { return a > b ? a : b; }
+
+int rencache_get_font_ref(lua_State *L, FontDesc *font_desc, int index) {
+  for (int i = 0; i < font_refs_len; i++) {
+    if (font_refs[i].font_desc == font_desc) {
+      return font_refs[i].index;
+    }
+  }
+  assert(font_refs_len + 1 <= FONT_REFS_MAX);
+
+  lua_pushvalue(L, index);
+  int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+  font_refs[font_refs_len++] = (FontRef) { font_desc, ref };
+  return ref;
+}
+
+
+static void font_refs_clear(lua_State *L) {
+  for (int i = 0; i < font_refs_len; i++) {
+    luaL_unref(L, LUA_REGISTRYINDEX, font_refs[i].index);
+  }
+  font_refs_len = 0;
+}
+
+
+static FontDesc *font_refs_lookup(int ref) {
+  for (int i = 0; i < font_refs_len; i++) {
+    if (font_refs[i].index == ref) {
+      return font_refs[i].font_desc;
+    }
+  }
+  return NULL;
+}
 
 /* 32bit fnv-1a hash */
 #define HASH_INITIAL 2166136261
@@ -115,12 +160,6 @@ void rencache_show_debug(bool enable) {
 }
 
 
-void rencache_free_font(FontDesc *font_desc) {
-  Command *cmd = push_command(FREE_FONT, COMMAND_BARE_SIZE);
-  if (cmd) { cmd->font_desc = font_desc; }
-}
-
-
 void rencache_set_clip_rect(RenRect rect) {
   Command *cmd = push_command(SET_CLIP, COMMAND_BARE_SIZE);
   if (cmd) { cmd->rect = intersect_rects(rect, screen_rect); }
@@ -136,7 +175,7 @@ void rencache_draw_rect(RenRect rect, RenColor color) {
   }
 }
 
-int rencache_draw_text(FontDesc *font_desc,
+int rencache_draw_text(lua_State *L, FontDesc *font_desc, int font_ref,
   const char *text, int x, int y, RenColor color, bool draw_subpixel,
   CPReplaceTable *replacements, RenColor replace_color)
 {
@@ -154,7 +193,7 @@ int rencache_draw_text(FontDesc *font_desc,
     if (cmd) {
       memcpy(cmd->text, text, sz);
       cmd->color = color;
-      cmd->font_desc = font_desc;
+      cmd->font_ref = font_ref;
       cmd->rect = rect;
       cmd->subpixel_scale = (draw_subpixel ? subpixel_scale : 1);
       cmd->x_subpixel_offset = x - subpixel_scale * rect.x;
@@ -173,7 +212,7 @@ void rencache_invalidate(void) {
 }
 
 
-void rencache_begin_frame(void) {
+void rencache_begin_frame(lua_State *L) {
   /* reset all cells if the screen width/height has changed */
   int w, h;
   ren_get_size(&w, &h);
@@ -182,6 +221,7 @@ void rencache_begin_frame(void) {
     screen_rect.height = h;
     rencache_invalidate();
   }
+  font_refs_clear(L);
 }
 
 
@@ -214,7 +254,7 @@ static void push_rect(RenRect r, int *count) {
 }
 
 
-void rencache_end_frame(void) {
+void rencache_end_frame(lua_State *L) {
   /* update cells from commands */
   Command *cmd = NULL;
   RenRect cr = screen_rect;
@@ -253,7 +293,6 @@ void rencache_end_frame(void) {
   }
 
   /* redraw updated regions */
-  bool has_free_commands = false;
   for (int i = 0; i < rect_count; i++) {
     /* draw */
     RenRect r = rect_buf[i];
@@ -261,10 +300,8 @@ void rencache_end_frame(void) {
 
     cmd = NULL;
     while (next_command(&cmd)) {
+      FontDesc *font_desc;
       switch (cmd->type) {
-        case FREE_FONT:
-          has_free_commands = true;
-          break;
         case SET_CLIP:
           ren_set_clip_rect(intersect_rects(cmd->rect, r));
           break;
@@ -272,15 +309,21 @@ void rencache_end_frame(void) {
           ren_draw_rect(cmd->rect, cmd->color);
           break;
         case DRAW_TEXT:
-          font_desc_set_tab_size(cmd->font_desc, cmd->tab_size);
-          ren_draw_text(cmd->font_desc, cmd->text, cmd->rect.x, cmd->rect.y, cmd->color,
-            cmd->replacements, cmd->replace_color);
+          font_desc = font_refs_lookup(cmd->font_ref);
+          if (font_desc) {
+            font_desc_set_tab_size(font_desc, cmd->tab_size);
+            ren_draw_text(font_desc, cmd->text, cmd->rect.x, cmd->rect.y, cmd->color,
+              cmd->replacements, cmd->replace_color);
+          }
           break;
         case DRAW_TEXT_SUBPIXEL:
-          font_desc_set_tab_size(cmd->font_desc, cmd->tab_size);
-          ren_draw_text_subpixel(cmd->font_desc, cmd->text,
-            cmd->subpixel_scale * cmd->rect.x + cmd->x_subpixel_offset, cmd->rect.y, cmd->color,
-            cmd->replacements, cmd->replace_color);
+          font_desc = font_refs_lookup(cmd->font_ref);
+          if (font_desc) {
+            font_desc_set_tab_size(font_desc, cmd->tab_size);
+            ren_draw_text_subpixel(font_desc, cmd->text,
+              cmd->subpixel_scale * cmd->rect.x + cmd->x_subpixel_offset, cmd->rect.y, cmd->color,
+              cmd->replacements, cmd->replace_color);
+          }
           break;
       }
     }
@@ -294,16 +337,6 @@ void rencache_end_frame(void) {
   /* update dirty rects */
   if (rect_count > 0) {
     ren_update_rects(rect_buf, rect_count);
-  }
-
-  /* free fonts */
-  if (has_free_commands) {
-    cmd = NULL;
-    while (next_command(&cmd)) {
-      if (cmd->type == FREE_FONT) {
-        font_desc_free(cmd->font_desc);
-      }
-    }
   }
 
   /* swap cell buffer and reset */
